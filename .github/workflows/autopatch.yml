@@ -1,0 +1,116 @@
+name: Check & Release Patched Prism
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force a specific upstream tag (e.g. 10.0.5). Leave empty to auto-detect."
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream Prism Launcher tag
+        id: upstream
+        run: |
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            TAG="${{ github.event.inputs.force_version }}"
+          else
+            TAG=$(curl -sf "https://api.github.com/repos/PrismLauncher/PrismLauncher/releases/latest" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              | jq -r '.tag_name')
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG"
+
+      - name: Check if already patched
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}")
+          if [ "$STATUS" = "200" ]; then
+            echo "already_patched=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skipping."
+          else
+            echo "already_patched=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG detected, will patch."
+          fi
+
+      - name: Clone Prism Launcher at upstream tag
+        if: steps.check.outputs.already_patched == 'false'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/PrismLauncher/PrismLauncher.git prism-src
+          echo "Cloned PrismLauncher @ $TAG"
+
+      - name: Apply patches
+        if: steps.check.outputs.already_patched == 'false'
+        run: |
+          cd prism-src
+          git apply --reject ../patches/0001-ownsMinecraft-always-true.patch
+          git apply --reject ../patches/0002-anyAccountIsValid-always-true.patch
+          git apply --reject ../patches/0003-decideLaunchMode-skip-auth.patch
+          echo "All patches applied."
+
+      - name: Verify patches applied
+        if: steps.check.outputs.already_patched == 'false'
+        run: |
+          grep -q "return true;" prism-src/launcher/minecraft/auth/MinecraftAccount.h \
+            && echo "✓ 0001 MinecraftAccount.h"
+          grep -q "return true;" prism-src/launcher/minecraft/auth/AccountList.cpp \
+            && echo "✓ 0002 AccountList.cpp"
+          grep -q "offline-patch" prism-src/launcher/LaunchController.cpp \
+            && echo "✓ 0003 LaunchController.cpp"
+
+      - name: Create combined patch file for the release
+        if: steps.check.outputs.already_patched == 'false'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          cat patches/*.patch > "offline-patches-${TAG}.patch"
+
+      - name: Create patched source archives
+        if: steps.check.outputs.already_patched == 'false'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          tar --exclude=".git" -czf "PrismLauncher-Offline-${TAG}.tar.gz" prism-src/
+          zip -r -q "PrismLauncher-Offline-${TAG}.zip" prism-src/ -x "prism-src/.git/*"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.already_patched == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: "PrismLauncher ${{ steps.upstream.outputs.tag }} (Offline Patched)"
+          body: |
+            Auto-patched from [PrismLauncher ${{ steps.upstream.outputs.tag }}](https://github.com/PrismLauncher/PrismLauncher/releases/tag/${{ steps.upstream.outputs.tag }}).
+
+            ### What's changed (3 patches)
+            | File | Change |
+            |------|--------|
+            | `launcher/minecraft/auth/MinecraftAccount.h` | `ownsMinecraft()` always returns `true` |
+            | `launcher/minecraft/auth/AccountList.cpp` | `anyAccountIsValid()` always returns `true` |
+            | `launcher/LaunchController.cpp` | `decideLaunchMode()` skips all auth checks |
+
+            ### Assets
+            - **`.tar.gz` / `.zip`** — Full patched source, ready to build
+            - **`.patch`** — Combined unified diff, apply with `git apply` on the official release
+
+            > **Build instructions:** See [Prism Launcher build docs](https://github.com/PrismLauncher/PrismLauncher#building)
+          files: |
+            PrismLauncher-Offline-${{ steps.upstream.outputs.tag }}.tar.gz
+            PrismLauncher-Offline-${{ steps.upstream.outputs.tag }}.zip
+            offline-patches-${{ steps.upstream.outputs.tag }}.patch
