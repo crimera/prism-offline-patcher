@@ -96,7 +96,8 @@ jobs:
 
       - name: Clone Prism Launcher at upstream tag
         run: |
-          git clone --depth 1 --branch "$TAG" \
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch "$TAG" \
             https://github.com/PrismLauncher/PrismLauncher.git prism-src
           echo "Cloned @ $TAG"
 
