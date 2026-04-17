@@ -1,27 +1,30 @@
-name: Check & Release Patched Prism
+name: Check & Build & Release
 
 on:
   schedule:
-    # Run daily at 06:00 UTC
     - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       force_version:
-        description: "Force a specific upstream tag (e.g. 10.0.5). Leave empty to auto-detect."
+        description: "Force upstream tag (e.g. 10.0.5). Leave empty to auto-detect."
         required: false
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
-  check-and-release:
+  # ─────────────────────────────────────────────
+  # 1. Detect whether a new upstream version exists
+  # ─────────────────────────────────────────────
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      skip: ${{ steps.check.outputs.skip }}
 
     steps:
-      - name: Checkout patcher repo
-        uses: actions/checkout@v4
-
-      - name: Get latest upstream Prism Launcher tag
+      - name: Get latest upstream tag
         id: upstream
         run: |
           if [ -n "${{ github.event.inputs.force_version }}" ]; then
@@ -34,7 +37,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Upstream latest: $TAG"
 
-      - name: Check if already patched
+      - name: Check if already released
         id: check
         run: |
           TAG="${{ steps.upstream.outputs.tag }}"
@@ -42,61 +45,219 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}")
           if [ "$STATUS" = "200" ]; then
-            echo "already_patched=true" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Release $TAG already exists, skipping."
           else
-            echo "already_patched=false" >> "$GITHUB_OUTPUT"
-            echo "New version $TAG detected, will patch."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG, proceeding with build."
           fi
 
+  # ─────────────────────────────────────────────
+  # 2. Build patched binaries (macOS + Windows)
+  # ─────────────────────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            artifact-name: macOS
+            cmake-preset: macos_universal
+            macosx-deployment-target: "12.0"
+            qt-version: "6.9.3"
+
+          - os: windows-2022
+            artifact-name: Windows-MSVC
+            cmake-preset: windows_msvc
+            vcvars-arch: amd64
+            qt-version: "6.10.2"
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      BUILD_DIR: build
+      INSTALL_DIR: install
+      BUILD_TYPE: Release
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx-deployment-target }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
       - name: Clone Prism Launcher at upstream tag
-        if: steps.check.outputs.already_patched == 'false'
         run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
           git clone --depth 1 --branch "$TAG" \
             https://github.com/PrismLauncher/PrismLauncher.git prism-src
-          echo "Cloned PrismLauncher @ $TAG"
+          echo "Cloned @ $TAG"
 
-      - name: Apply patches
-        if: steps.check.outputs.already_patched == 'false'
+      - name: Apply offline patches
         run: |
           cd prism-src
-          git apply --reject ../patches/0001-ownsMinecraft-always-true.patch
-          git apply --reject ../patches/0002-anyAccountIsValid-always-true.patch
-          git apply --reject ../patches/0003-decideLaunchMode-skip-auth.patch
+          git apply --whitespace=nowarn ../patcher/patches/0001-ownsMinecraft-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0002-anyAccountIsValid-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0003-decideLaunchMode-skip-auth.patch
           echo "All patches applied."
 
-      - name: Verify patches applied
-        if: steps.check.outputs.already_patched == 'false'
+      # ── macOS deps ──────────────────────────────
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
         run: |
-          grep -q "return true;" prism-src/launcher/minecraft/auth/MinecraftAccount.h \
-            && echo "✓ 0001 MinecraftAccount.h"
-          grep -q "return true;" prism-src/launcher/minecraft/auth/AccountList.cpp \
-            && echo "✓ 0002 AccountList.cpp"
-          grep -q "offline-patch" prism-src/launcher/LaunchController.cpp \
-            && echo "✓ 0003 LaunchController.cpp"
+          brew update
+          brew install ninja extra-cmake-modules temurin@17 mono
+          echo "JAVA_HOME=$(/usr/libexec/java_home -v 17)" >> "$GITHUB_ENV"
 
-      - name: Create combined patch file for the release
-        if: steps.check.outputs.already_patched == 'false'
+      - name: Setup vcpkg (macOS)
+        if: runner.os == 'macOS'
         run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
-          cat patches/*.patch > "offline-patches-${TAG}.patch"
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> "$GITHUB_ENV"
 
-      - name: Create patched source archives
-        if: steps.check.outputs.already_patched == 'false'
+      - name: Export GitHub Actions cache variables (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── Windows deps ─────────────────────────────
+      - name: Enter VS Developer shell (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.vcvars-arch }}
+          vsversion: "2022"
+
+      - name: Setup Java (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Setup vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
-          tar --exclude=".git" -czf "PrismLauncher-Offline-${TAG}.tar.gz" prism-src/
-          zip -r -q "PrismLauncher-Offline-${TAG}.zip" prism-src/ -x "prism-src/.git/*"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -Append $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" | Out-File -Append $env:GITHUB_ENV
 
-      - name: Create GitHub Release
-        if: steps.check.outputs.already_patched == 'false'
+      - name: Export GitHub Actions cache variables (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── Build ────────────────────────────────────
+      - name: Configure
+        working-directory: prism-src
+        run: cmake --preset "${{ matrix.cmake-preset }}"
+
+      - name: Build
+        working-directory: prism-src
+        run: cmake --build --preset "${{ matrix.cmake-preset }}" --config "$BUILD_TYPE"
+
+      # ── Package: macOS ───────────────────────────
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        working-directory: prism-src
+        run: |
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE"
+
+          cd "$INSTALL_DIR"
+          chmod +x "PrismLauncher.app/Contents/MacOS/prismlauncher"
+
+          # Ad-hoc sign (no Apple cert)
+          sudo codesign --sign "-" --deep --force \
+            --entitlements "../program_info/AdhocSignedApp.entitlements" \
+            --options runtime \
+            "PrismLauncher.app/Contents/MacOS/prismlauncher"
+
+          mv "PrismLauncher.app" "Prism Launcher.app"
+
+          # Create .zip
+          ditto -c -k --sequesterRsrc --keepParent "Prism Launcher.app" \
+            "../../PrismLauncher-macOS-${{ env.TAG }}.zip"
+
+          # Create .dmg
+          mkdir -p dmg-src
+          cp -R "Prism Launcher.app" dmg-src/
+          ln -s /Applications dmg-src/
+          hdiutil create \
+            -volname "Prism Launcher ${{ env.TAG }}" \
+            -srcfolder dmg-src \
+            -ov -format ULMO \
+            "../../PrismLauncher-macOS-${{ env.TAG }}.dmg"
+
+      # ── Package: Windows ─────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: prism-src
+        shell: pwsh
+        run: |
+          cmake --install $env:BUILD_DIR --config $env:BUILD_TYPE
+          Compress-Archive -Path "$env:INSTALL_DIR\*" `
+            -DestinationPath "..\..\PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip"
+
+      # ── Upload artifacts ─────────────────────────
+      - name: Upload macOS artifacts
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ env.TAG }}
+          path: |
+            PrismLauncher-macOS-${{ env.TAG }}.zip
+            PrismLauncher-macOS-${{ env.TAG }}.dmg
+
+      - name: Upload Windows artifacts
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.TAG }}
+          path: PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+
+  # ─────────────────────────────────────────────
+  # 3. Create GitHub Release with all artifacts
+  # ─────────────────────────────────────────────
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build combined patch file
+        run: cat patches/*.patch > "offline-patches-${TAG}.patch"
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.upstream.outputs.tag }}
-          name: "PrismLauncher ${{ steps.upstream.outputs.tag }} (Offline Patched)"
+          tag_name: ${{ env.TAG }}
+          name: "PrismLauncher ${{ env.TAG }} (Offline Patched)"
           body: |
-            Auto-patched from [PrismLauncher ${{ steps.upstream.outputs.tag }}](https://github.com/PrismLauncher/PrismLauncher/releases/tag/${{ steps.upstream.outputs.tag }}).
+            Auto-patched from [PrismLauncher ${{ env.TAG }}](https://github.com/PrismLauncher/PrismLauncher/releases/tag/${{ env.TAG }}).
 
             ### What's changed (3 patches)
             | File | Change |
@@ -105,12 +266,15 @@ jobs:
             | `launcher/minecraft/auth/AccountList.cpp` | `anyAccountIsValid()` always returns `true` |
             | `launcher/LaunchController.cpp` | `decideLaunchMode()` skips all auth checks |
 
-            ### Assets
-            - **`.tar.gz` / `.zip`** — Full patched source, ready to build
-            - **`.patch`** — Combined unified diff, apply with `git apply` on the official release
-
-            > **Build instructions:** See [Prism Launcher build docs](https://github.com/PrismLauncher/PrismLauncher#building)
+            ### Downloads
+            | File | Platform |
+            |------|----------|
+            | `PrismLauncher-macOS-*.dmg` | macOS (Universal, ad-hoc signed) |
+            | `PrismLauncher-macOS-*.zip` | macOS (app bundle zip) |
+            | `PrismLauncher-Windows-MSVC-*.zip` | Windows x64 |
+            | `offline-patches-*.patch` | Unified diff — apply with `git apply` |
           files: |
-            PrismLauncher-Offline-${{ steps.upstream.outputs.tag }}.tar.gz
-            PrismLauncher-Offline-${{ steps.upstream.outputs.tag }}.zip
-            offline-patches-${{ steps.upstream.outputs.tag }}.patch
+            artifacts/PrismLauncher-macOS-${{ env.TAG }}.dmg
+            artifacts/PrismLauncher-macOS-${{ env.TAG }}.zip
+            artifacts/PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+            offline-patches-${{ env.TAG }}.patch
