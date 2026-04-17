@@ -229,7 +229,7 @@ jobs:
         run: |
           cmake --install $env:BUILD_DIR --config $env:BUILD_TYPE
           Compress-Archive -Path "$env:INSTALL_DIR\*" `
-            -DestinationPath "..\..\PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip"
+            -DestinationPath "..\PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip"
 
       # ── Upload artifacts ─────────────────────────
       - name: Upload macOS artifacts
