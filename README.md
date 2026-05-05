@@ -18,7 +18,7 @@ Only **3 files** changed:
 |-------|------|--------|
 | `0001` | `launcher/minecraft/auth/MinecraftAccount.h` | `ownsMinecraft()` hardcoded to `return true` |
 | `0002` | `launcher/minecraft/auth/AccountList.cpp` | `anyAccountIsValid()` hardcoded to `return true` |
-| `0003` | `launcher/LaunchController.cpp` | `decideLaunchMode()` body replaced — skips all auth refresh/reauth logic |
+| `0003` | `launcher/LaunchController.cpp` | `decideLaunchMode()` bypasses auth gating while preserving explicit offline/demo launches |
 
 ## Manual usage
 
@@ -36,6 +36,11 @@ git apply ../patches/0003-decideLaunchMode-skip-auth.patch
 cmake --preset linux && cmake --build --preset linux
 ```
 
-## Force a specific version
+## Manual workflow options
 
-Trigger the workflow manually from the **Actions** tab and enter the version tag (e.g. `10.0.5`).
+Trigger the workflow manually from the **Actions** tab.
+
+- `force_version`: build a specific upstream tag (for example `10.0.5`)
+- `force_rebuild`: rebuild even if a release for that tag already exists
+
+Use `force_rebuild` when only the patches changed and you want to rebuild the current release tag.
