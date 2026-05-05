@@ -1,14 +1,11 @@
---- a/launcher/LaunchController.cpp	2026-04-18 03:39:54
-+++ b/launcher/LaunchController.cpp	2026-04-18 03:43:38
-@@ -128,89 +128,9 @@
+diff --git a/launcher/LaunchController.cpp b/launcher/LaunchController.cpp
+index d263cc5..323f46c 100644
+--- a/launcher/LaunchController.cpp
++++ b/launcher/LaunchController.cpp
+@@ -133,84 +133,14 @@ LaunchDecision LaunchController::decideLaunchMode()
+         return LaunchDecision::Continue;
+     }
  
- LaunchDecision LaunchController::decideLaunchMode()
- {
--    if (!m_accountToUse || m_wantedLaunchMode == LaunchMode::Demo) {
--        m_actualLaunchMode = LaunchMode::Demo;
--        return LaunchDecision::Continue;
--    }
--
 -    if (m_wantedLaunchMode == LaunchMode::Normal) {
 -        if (m_accountToUse->shouldRefresh() || m_accountToUse->accountState() == AccountState::Offline) {
 -            // Force account refresh on the account used to launch the instance updating the AccountState
@@ -35,9 +32,11 @@
 -
 -    if (!accountToCheck) {
 -        m_actualLaunchMode = LaunchMode::Demo;
--        return LaunchDecision::Continue;
--    }
--
++    if (m_wantedLaunchMode == LaunchMode::Offline || m_accountToUse->accountType() == AccountType::Offline) {
++        m_actualLaunchMode = LaunchMode::Offline;
+         return LaunchDecision::Continue;
+     }
+ 
 -    auto state = accountToCheck->accountState();
 -    if (state == AccountState::Unchecked || state == AccountState::Errored) {
 -        accountToCheck->refresh();
@@ -87,19 +86,9 @@
 -    }
 -
 -    return LaunchDecision::Abort;
-+    // [offline-patch]: skip auth checks, but preserve explicit demo/offline launches
-+    if (!m_accountToUse || m_wantedLaunchMode == LaunchMode::Demo) {
-+        m_actualLaunchMode = LaunchMode::Demo;
-+        return LaunchDecision::Continue;
-+    }
-+
-+    if (m_wantedLaunchMode == LaunchMode::Offline || m_accountToUse->accountType() == AccountType::Offline) {
-+        m_actualLaunchMode = LaunchMode::Offline;
-+        return LaunchDecision::Continue;
-+    }
-+
++    // [offline-patch]: skip auth checks for normal launches
 +    m_actualLaunchMode = LaunchMode::Normal;
 +    return LaunchDecision::Continue;
-+}
-+
-+bool LaunchController::askPlayDemo() const
+ }
+ 
+ bool LaunchController::askPlayDemo() const
