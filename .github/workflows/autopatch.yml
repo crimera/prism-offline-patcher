@@ -122,7 +122,9 @@ jobs:
           git apply --whitespace=nowarn ../patcher/patches/0001-ownsMinecraft-always-true.patch
           git apply --whitespace=nowarn ../patcher/patches/0002-anyAccountIsValid-always-true.patch
           git apply --whitespace=nowarn ../patcher/patches/0003-decideLaunchMode-skip-auth.patch
+          git apply --whitespace=nowarn ../patcher/patches/0004-download-missing-libraries-offline.patch
           echo "All patches applied."
+
 
       # ── Linux deps ──────────────────────────────
       - name: Install Linux dependencies
