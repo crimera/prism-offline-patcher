@@ -85,6 +85,11 @@ jobs:
             vcvars-arch: amd64
             qt-version: "6.10.2"
 
+          - os: ubuntu-24.04
+            artifact-name: Linux
+            cmake-preset: linux
+            qt-version: "6.10.2"
+
     runs-on: ${{ matrix.os }}
 
     env:
@@ -118,6 +123,65 @@ jobs:
           git apply --whitespace=nowarn ../patcher/patches/0002-anyAccountIsValid-always-true.patch
           git apply --whitespace=nowarn ../patcher/patches/0003-decideLaunchMode-skip-auth.patch
           echo "All patches applied."
+
+      # ── Linux deps ──────────────────────────────
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install \
+            dpkg-dev \
+            ninja-build extra-cmake-modules pkg-config scdoc \
+            cmark gamemode-dev libarchive-dev libcmark-dev libqrencode-dev zlib1g-dev \
+            libxcb-cursor-dev libtomlplusplus-dev
+
+      - name: Setup AppImage tooling (Linux)
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine AppImage architecture to use
+          dpkg_arch="$(dpkg-architecture -q DEB_HOST_ARCH_CPU)"
+          case "$dpkg_arch" in
+            "amd64")
+              APPIMAGE_ARCH="x86_64"
+              ;;
+            "arm64")
+              APPIMAGE_ARCH="aarch64"
+              ;;
+            *)
+              echo "# 🚨 The Debian architecture \"$dpkg_arch\" is not recognized!" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p ~/bin
+          gh release download \
+            --repo VHSgunzo/sharun \
+            --pattern "sharun-$APPIMAGE_ARCH-aio" \
+            --output ~/bin/sharun
+
+          gh release download continuous \
+            --repo DioEgizio/go-appimage \
+            --pattern "mkappimage-*-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/mkappimage
+
+          gh release download \
+            --repo AppImageCommunity/AppImageUpdate \
+            --pattern "AppImageUpdate-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/AppImageUpdate.AppImage
+          
+          chmod +x ~/bin/*
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Qt (Linux)
+        if: runner.os == 'Linux'
+        uses: jurplel/install-qt-action@v4
+        with:
+          aqtversion: "==3.1.*"
+          version: ${{ matrix.qt-version }}
+          modules: qtimageformats qtnetworkauth
+          cache: false
 
       # ── macOS deps ──────────────────────────────
       - name: Install macOS dependencies
@@ -241,6 +305,81 @@ jobs:
           Compress-Archive -Path "$env:INSTALL_DIR\*" `
             -DestinationPath "..\PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip"
 
+      # ── Package: Linux ───────────────────────────
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        working-directory: prism-src
+        run: |
+          # Cleanup Qt installation on Linux
+          rm -rf "$QT_PLUGIN_PATH"/printsupport
+          rm -rf "$QT_PLUGIN_PATH"/sqldrivers
+          rm -rf "$QT_PLUGIN_PATH"/help
+          rm -rf "$QT_PLUGIN_PATH"/designer
+          rm -rf "$QT_PLUGIN_PATH"/qmltooling
+          rm -rf "$QT_PLUGIN_PATH"/qmlls
+          rm -rf "$QT_PLUGIN_PATH"/qmllint
+          rm -rf "$QT_PLUGIN_PATH"/platformthemes/libqgtk3.so
+
+          # Fixup architecture naming for AppImages
+          dpkg_arch="$(dpkg-architecture -q DEB_HOST_ARCH_CPU)"
+          case "$dpkg_arch" in
+            "amd64")
+              APPIMAGE_ARCH="x86_64"
+              ;;
+            "arm64")
+              APPIMAGE_ARCH="aarch64"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+          # AppImage packaging
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-appdir
+
+          sharun lib4bin \
+            --hard-links \
+            --with-hooks \
+            --dst-dir install-appdir \
+            install-appdir/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          cp ~/bin/AppImageUpdate.AppImage install-appdir/bin/
+          find install-appdir -name '*gamemode*' -exec rm {} +
+
+          echo "PRISMLAUNCHER_DISABLE_GLVULKAN=1" >> install-appdir/.env
+          echo "QT_QPA_PLATFORMTHEME=xdgdesktopportal" >> install-appdir/.env
+          ln -s org.prismlauncher.PrismLauncher.metainfo.xml install-appdir/share/metainfo/org.prismlauncher.PrismLauncher.appdata.xml
+          ln -s share/applications/org.prismlauncher.PrismLauncher.desktop install-appdir/
+          ln -s share/icons/hicolor/256x256/apps/org.prismlauncher.PrismLauncher.png install-appdir/
+          mv install-appdir/{sharun,AppRun}
+
+          mkappimage \
+            --updateinformation "gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage.zsync" \
+            install-appdir \
+            "../PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage"
+
+          # Portable tarball packaging
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-portable
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-portable --component portable
+
+          sharun lib4bin \
+            --with-hooks \
+            --hard-links \
+            --dst-dir install-portable \
+            install-portable/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          find install-portable -name '*gamemode*' -exec rm {} +
+
+          for l in $(find install-portable -type f -o -type l); do
+            l=${l#$(pwd)/}
+            l=${l#install-portable/}
+            l=${l#./}
+            echo "$l"
+          done > install-portable/manifest.txt
+
+          cd install-portable
+          tar -czf ../../PrismLauncher-Linux-Portable-$APPIMAGE_ARCH.tar.gz *
+
       # ── Upload artifacts ─────────────────────────
       - name: Upload macOS artifacts
         if: runner.os == 'macOS'
@@ -257,6 +396,16 @@ jobs:
         with:
           name: windows-${{ env.TAG }}
           path: PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+
+      - name: Upload Linux artifacts
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ env.TAG }}
+          path: |
+            PrismLauncher-Linux-*.AppImage
+            PrismLauncher-Linux-*.AppImage.zsync
+            PrismLauncher-Linux-Portable-*.tar.gz
 
   # ─────────────────────────────────────────────
   # 3. Create GitHub Release with all artifacts
@@ -304,9 +453,15 @@ jobs:
             | `PrismLauncher-macOS-*.dmg` | macOS (Universal, ad-hoc signed) |
             | `PrismLauncher-macOS-*.zip` | macOS (app bundle zip) |
             | `PrismLauncher-Windows-MSVC-*.zip` | Windows x64 |
+            | `PrismLauncher-Linux-*.AppImage` | Linux AppImage (x86_64) |
+            | `PrismLauncher-Linux-*.AppImage.zsync` | AppImage Zsync (x86_64) |
+            | `PrismLauncher-Linux-Portable-*.tar.gz` | Linux Portable (x86_64) |
             | `offline-patches-*.patch` | Unified diff — apply with `git apply` |
           files: |
             artifacts/PrismLauncher-macOS-${{ env.TAG }}.dmg
             artifacts/PrismLauncher-macOS-${{ env.TAG }}.zip
             artifacts/PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+            artifacts/PrismLauncher-Linux-*.AppImage
+            artifacts/PrismLauncher-Linux-*.AppImage.zsync
+            artifacts/PrismLauncher-Linux-Portable-*.tar.gz
             offline-patches-${{ env.TAG }}.patch
